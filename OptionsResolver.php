@@ -75,6 +75,15 @@ class OptionsResolver implements Options
      */
     private $calling = array();
 
+    private $nested = array();
+
+    private $nestedLevel = array();
+
+    /**
+     * @var OptionsResolver
+     */
+    private $parent = null;
+
     /**
      * Whether the instance is locked for reading.
      *
@@ -85,11 +94,11 @@ class OptionsResolver implements Options
      */
     private $locked = false;
 
-    private static $typeAliases = array(
+    private static $typeAliases = [
         'boolean' => 'bool',
         'integer' => 'int',
         'double' => 'float',
-    );
+    ];
 
     /**
      * Sets the default value of a given option.
@@ -125,7 +134,7 @@ class OptionsResolver implements Options
      * sub-classes.
      *
      * @param string $option The name of the option
-     * @param mixed  $value  The default value of the option
+     * @param mixed $value The default value of the option
      *
      * @return $this
      *
@@ -138,6 +147,28 @@ class OptionsResolver implements Options
         // inconsistent results.
         if ($this->locked) {
             throw new AccessException('Default values cannot be set from a lazy option or normalizer.');
+        }
+
+        // If an options is array that shoul be created
+        // new nested OptionResolver
+        if (\is_array($value)) {
+            $optionsResolver = new OptionsResolver();
+            // Specify the full path for displaying errors
+            $optionsResolver->setNestedLevel(
+                array_merge(
+                    $this->getNestedLevel(),
+                    [$option]
+                )
+            );
+            $optionsResolver->setParent($this);
+
+            foreach ($value as $key => $item) {
+                $optionsResolver->setDefault($key, $item);
+            }
+
+            $this->nested[$option] = $optionsResolver;
+
+            return $this;
         }
 
         // If an option is a closure that should be evaluated lazily, store it
@@ -209,12 +240,24 @@ class OptionsResolver implements Options
      * Returns true if {@link setDefault()} was called for this option.
      * An option is also considered set if it was set to null.
      *
-     * @param string $option The option name
+     * @param string|string[] $option The option name
      *
      * @return bool Whether a default value is set
      */
     public function hasDefault($option)
     {
+        if (\is_array($option)) {
+            $nestedOption = array_shift($option);
+            if (!array_key_exists($nestedOption, $this->nested)) {
+                return false;
+            }
+
+            return $this->nested[$nestedOption]->hasDefault(
+                1 === count($option) ?
+                    $option[0] : $option
+            );
+        }
+
         return array_key_exists($option, $this->defaults);
     }
 
@@ -234,6 +277,18 @@ class OptionsResolver implements Options
         }
 
         foreach ((array) $optionNames as $option) {
+            if (\is_array($option)) {
+                $nestedOption = array_shift($option);
+                if (array_key_exists($nestedOption, $this->nested)) {
+                    $this->nested[$nestedOption]->setRequired(
+                        1 === count($option) ?
+                            $option : [$option]
+                    );
+                }
+
+                continue;
+            }
+
             $this->defined[$option] = true;
             $this->required[$option] = true;
         }
@@ -252,6 +307,15 @@ class OptionsResolver implements Options
      */
     public function isRequired($option)
     {
+        if (\is_array($option)) {
+            $nestedOption = array_shift($option);
+
+            return $this->nested[$nestedOption]->isRequired(
+                1 === count($option) ?
+                    $option[0] : $option
+            );
+        }
+
         return isset($this->required[$option]);
     }
 
@@ -262,9 +326,24 @@ class OptionsResolver implements Options
      *
      * @see isRequired()
      */
-    public function getRequiredOptions()
+    public function getRequiredOptions(array $nestedLevel = [])
     {
-        return array_keys($this->required);
+        $requiredOptions = [];
+
+        foreach($this->nested as $key => $nested){
+            if($required = $nested->getRequiredOptions(array_merge($nestedLevel, [$key]))) {
+                $requiredOptions = $required;
+            }
+        }
+
+        foreach($this->required as $key => $item){
+            if(count($nestedLevel)){
+                $key = array_merge($nestedLevel, [$key]);
+            }
+            $requiredOptions[] = $key;
+        }
+
+        return $requiredOptions;
     }
 
     /**
@@ -274,13 +353,26 @@ class OptionsResolver implements Options
      * to {@link setDefault()}. This option must be passed explicitly to
      * {@link resolve()}, otherwise an exception will be thrown.
      *
-     * @param string $option The name of the option
+     * @param string|string[] $option The name of the option
      *
      * @return bool Whether the option is missing
      */
     public function isMissing($option)
     {
-        return isset($this->required[$option]) && !array_key_exists($option, $this->defaults);
+        if(!$this->isRequired($option)){
+            return false;
+        }
+
+        if (\is_array($option)) {
+            $nestedOption = array_shift($option);
+
+            return $this->nested[$nestedOption]->isMissing(
+                1 === count($option) ?
+                    $option[0] : $option
+            );
+        }
+
+        return !array_key_exists($option, $this->defaults);
     }
 
     /**
@@ -290,9 +382,28 @@ class OptionsResolver implements Options
      *
      * @see isMissing()
      */
-    public function getMissingOptions()
+    public function getMissingOptions(array $nestedLevel = [])
     {
-        return array_keys(array_diff_key($this->required, $this->defaults));
+        $missingOptions = [];
+
+        foreach($this->nested as $key => $nested){
+            if($required = $nested->getMissingOptions(array_merge($nestedLevel, [$key]))) {
+                $missingOptions = $required;
+            }
+        }
+
+        foreach($this->required as $key => $item){
+            if(array_key_exists($key, $this->defaults)){
+                continue;
+            }
+
+            if(count($nestedLevel)){
+                $key = array_merge($nestedLevel, [$key]);
+            }
+            $missingOptions[] = $key;
+        }
+
+        return $missingOptions;
     }
 
     /**
@@ -315,6 +426,18 @@ class OptionsResolver implements Options
         }
 
         foreach ((array) $optionNames as $option) {
+            if (\is_array($option)) {
+                $nestedOption = array_shift($option);
+                if (array_key_exists($nestedOption, $this->nested)) {
+                    $this->nested[$nestedOption]->setDefined(
+                        1 === count($option) ?
+                            $option : array($option)
+                    );
+                }
+
+                continue;
+            }
+
             $this->defined[$option] = true;
         }
 
@@ -327,12 +450,21 @@ class OptionsResolver implements Options
      * Returns true for any option passed to {@link setDefault()},
      * {@link setRequired()} or {@link setDefined()}.
      *
-     * @param string $option The option name
+     * @param string|string[] $option The option name
      *
      * @return bool Whether the option is defined
      */
     public function isDefined($option)
     {
+        if (\is_array($option)) {
+            $nestedOption = array_shift($option);
+
+            return $this->nested[$nestedOption]->isDefined(
+                1 === count($option) ?
+                    $option[0] : $option
+            );
+        }
+
         return isset($this->defined[$option]);
     }
 
@@ -343,9 +475,25 @@ class OptionsResolver implements Options
      *
      * @see isDefined()
      */
-    public function getDefinedOptions()
+    public function getDefinedOptions(array $nestedLevel = [])
     {
-        return array_keys($this->defined);
+        $definedOptions = [];
+
+        foreach($this->nested as $key => $nested){
+            if($required = $nested->getDefinedOptions(array_merge($nestedLevel, [$key]))) {
+                $definedOptions = $required;
+            }
+        }
+
+        foreach($this->defined as $key => $item){
+
+            if(count($nestedLevel)){
+                $key = array_merge($nestedLevel, [$key]);
+            }
+            $definedOptions[] = $key;
+        }
+
+        return $definedOptions;
     }
 
     /**
@@ -368,7 +516,7 @@ class OptionsResolver implements Options
      *
      * The resolved option value is set to the return value of the closure.
      *
-     * @param string   $option     The option name
+     * @param string|string[] $option The option name
      * @param \Closure $normalizer The normalizer
      *
      * @return $this
@@ -380,6 +528,19 @@ class OptionsResolver implements Options
     {
         if ($this->locked) {
             throw new AccessException('Normalizers cannot be set from a lazy option or normalizer.');
+        }
+
+        if (\is_array($option)) {
+            $nestedOption = array_shift($option);
+            if (array_key_exists($nestedOption, $this->nested)) {
+                $this->nested[$nestedOption]->setNormalizer(
+                    1 === count($option) ?
+                        $option[0] : $option,
+                    $normalizer
+                );
+            }
+
+            return $this;
         }
 
         if (!isset($this->defined[$option])) {
@@ -411,8 +572,8 @@ class OptionsResolver implements Options
      * The closure receives the value as argument and should return true to
      * accept the value and false to reject the value.
      *
-     * @param string $option        The option name
-     * @param mixed  $allowedValues One or more acceptable values/closures
+     * @param string|string[] $option The option name
+     * @param mixed $allowedValues One or more acceptable values/closures
      *
      * @return $this
      *
@@ -423,6 +584,19 @@ class OptionsResolver implements Options
     {
         if ($this->locked) {
             throw new AccessException('Allowed values cannot be set from a lazy option or normalizer.');
+        }
+
+        if (\is_array($option)) {
+            $nestedOption = array_shift($option);
+            if (array_key_exists($nestedOption, $this->nested)) {
+                $this->nested[$nestedOption]->setAllowedValues(
+                    1 === count($option) ?
+                        $option[0] : $option,
+                    $allowedValues
+                );
+            }
+
+            return $this;
         }
 
         if (!isset($this->defined[$option])) {
@@ -456,8 +630,8 @@ class OptionsResolver implements Options
      * The closure receives the value as argument and should return true to
      * accept the value and false to reject the value.
      *
-     * @param string $option        The option name
-     * @param mixed  $allowedValues One or more acceptable values/closures
+     * @param string|string[] $option The option name
+     * @param mixed $allowedValues One or more acceptable values/closures
      *
      * @return $this
      *
@@ -468,6 +642,19 @@ class OptionsResolver implements Options
     {
         if ($this->locked) {
             throw new AccessException('Allowed values cannot be added from a lazy option or normalizer.');
+        }
+
+        if (\is_array($option)) {
+            $nestedOption = array_shift($option);
+            if (array_key_exists($nestedOption, $this->nested)) {
+                $this->nested[$nestedOption]->addAllowedValues(
+                    1 === count($option) ?
+                        $option[0] : $option,
+                    $allowedValues
+                );
+            }
+
+            return $this;
         }
 
         if (!isset($this->defined[$option])) {
@@ -501,7 +688,7 @@ class OptionsResolver implements Options
      * acceptable. Additionally, fully-qualified class or interface names may
      * be passed.
      *
-     * @param string          $option       The option name
+     * @param string|string[] $option The option name
      * @param string|string[] $allowedTypes One or more accepted types
      *
      * @return $this
@@ -513,6 +700,19 @@ class OptionsResolver implements Options
     {
         if ($this->locked) {
             throw new AccessException('Allowed types cannot be set from a lazy option or normalizer.');
+        }
+
+        if (\is_array($option)) {
+            $nestedOption = array_shift($option);
+            if (array_key_exists($nestedOption, $this->nested)) {
+                $this->nested[$nestedOption]->setAllowedTypes(
+                    1 === count($option) ?
+                        $option[0] : $option,
+                    $allowedTypes
+                );
+            }
+
+            return $this;
         }
 
         if (!isset($this->defined[$option])) {
@@ -540,7 +740,7 @@ class OptionsResolver implements Options
      * acceptable. Additionally, fully-qualified class or interface names may
      * be passed.
      *
-     * @param string          $option       The option name
+     * @param string|string[] $option The option name
      * @param string|string[] $allowedTypes One or more accepted types
      *
      * @return $this
@@ -552,6 +752,19 @@ class OptionsResolver implements Options
     {
         if ($this->locked) {
             throw new AccessException('Allowed types cannot be added from a lazy option or normalizer.');
+        }
+
+        if (\is_array($option)) {
+            $nestedOption = array_shift($option);
+            if (array_key_exists($nestedOption, $this->nested)) {
+                $this->nested[$nestedOption]->addAllowedTypes(
+                    1 === count($option) ?
+                        $option[0] : $option,
+                    $allowedTypes
+                );
+            }
+
+            return $this;
         }
 
         if (!isset($this->defined[$option])) {
@@ -592,6 +805,18 @@ class OptionsResolver implements Options
         }
 
         foreach ((array) $optionNames as $option) {
+            if (\is_array($option)) {
+                $nestedOption = array_shift($option);
+                if (array_key_exists($nestedOption, $this->nested)) {
+                    $this->nested[$nestedOption]->remove(
+                        1 === count($option) ?
+                            $option : array($option)
+                    );
+                }
+
+                continue;
+            }
+
             unset($this->defined[$option], $this->defaults[$option], $this->required[$option], $this->resolved[$option]);
             unset($this->lazy[$option], $this->normalizers[$option], $this->allowedTypes[$option], $this->allowedValues[$option]);
         }
@@ -620,6 +845,8 @@ class OptionsResolver implements Options
         $this->normalizers = array();
         $this->allowedTypes = array();
         $this->allowedValues = array();
+        $this->nested = array();
+        $this->nestedLevel = array();
 
         return $this;
     }
@@ -657,22 +884,39 @@ class OptionsResolver implements Options
         // Allow this method to be called multiple times
         $clone = clone $this;
 
+        // If there are nested entities, then we pass them
+        if (count($this->nested)) {
+            foreach ($this->nested as $option => $item) {
+                $clone->resolved[$option] = $item->resolve($options[$option] ?? []);
+            }
+        }
+
         // Make sure that no unknown options are passed
         $diff = array_diff_key($options, $clone->defined);
+        $diff = array_diff_key($diff, $this->nested);
 
         if (count($diff) > 0) {
             ksort($clone->defined);
             ksort($diff);
 
+            // Show full path to option
+            $keys = array_map(function ($item) use ($clone) {
+                return implode(':', $clone->getNestedLevel()) . ':' . $item;
+            }, array_keys($diff));
+
             throw new UndefinedOptionsException(sprintf(
                 (count($diff) > 1 ? 'The options "%s" do not exist.' : 'The option "%s" does not exist.').' Defined options are: "%s".',
-                implode('", "', array_keys($diff)),
+                implode('", "', $keys),
                 implode('", "', array_keys($clone->defined))
             ));
         }
 
         // Override options set by the user
         foreach ($options as $option => $value) {
+            if (isset($this->nested[$option])) {
+                continue;
+            }
+
             $clone->defaults[$option] = $value;
             unset($clone->resolved[$option], $clone->lazy[$option]);
         }
@@ -683,9 +927,17 @@ class OptionsResolver implements Options
         if (count($diff) > 0) {
             ksort($diff);
 
+            // Show full path to option
+            $keys = array_map(function ($item) use ($clone) {
+                $names = $clone->getNestedLevel();
+                $names[] = $item;
+
+                return implode(':', $names);
+            }, array_keys($diff));
+
             throw new MissingOptionsException(sprintf(
                 count($diff) > 1 ? 'The required options "%s" are missing.' : 'The required option "%s" is missing.',
-                implode('", "', array_keys($diff))
+                implode('", "', $keys)
             ));
         }
 
@@ -704,7 +956,7 @@ class OptionsResolver implements Options
     /**
      * Returns the resolved value of an option.
      *
-     * @param string $option The option name
+     * @param string|string[] $option The option name
      *
      * @return mixed The option value
      *
@@ -720,6 +972,21 @@ class OptionsResolver implements Options
     {
         if (!$this->locked) {
             throw new AccessException('Array access is only supported within closures of lazy options and normalizers.');
+        }
+
+        if (\is_array($option)) {
+            $nestedOption = array_shift($option);
+            if (!isset($this->nested[$nestedOption])) {
+                throw new NoSuchOptionException(sprintf(
+                    'The nested option "%s" has no value set.',
+                    $nestedOption
+                ));
+            }
+
+            return $this->nested[$nestedOption]->offsetGet(
+                1 === count($option) ?
+                    $option[0] : $option
+            );
         }
 
         // Shortcut for resolved options
@@ -965,6 +1232,55 @@ class OptionsResolver implements Options
         }
 
         return count($this->defaults);
+    }
+
+    /**
+     * @return array
+     */
+    public function getNestedLevel(): array
+    {
+        return $this->nestedLevel;
+    }
+
+    /**
+     * @param array $nestedLevel
+     *
+     * @return self
+     */
+    public function setNestedLevel(array $nestedLevel): self
+    {
+        $this->nestedLevel = $nestedLevel;
+
+        return $this;
+    }
+
+    /**
+     * Вызов происходит только в замыканиях и родитель не всегда заблокирован
+     * Блокируем его принудительно
+     *
+     * @return null
+     */
+    public function getParent()
+    {
+        if (!$this->parent) {
+            throw new AccessException('You are in first level OptionResolver');
+        }
+
+        $this->parent->locked = true;
+
+        return $this->parent;
+    }
+
+    /**
+     * @param null $parent
+     *
+     * @return self
+     */
+    public function setParent($parent): self
+    {
+        $this->parent = $parent;
+
+        return $this;
     }
 
     /**
